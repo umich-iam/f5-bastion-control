@@ -1,0 +1,137 @@
+# author: Louis Serianni email: serlouis@umich.edu
+# purpose: non-prod template for deplying ssl certs and keys to f5 load balancer and update client ssl profile.
+---
+- name: Retrieve F5 Admin Password from CyberArk
+  hosts: localhost
+  become: no
+  gather_facts: false
+
+  vars:
+    cyberark_base_url: "https://mcprod-pvwa.dsc.umich.edu"
+
+  tasks:
+    - name: credential retrieval advanced
+      cyberark_credential:
+        api_base_url: "{{ cyberark_base_url }}"
+        validate_certs: yes
+        client_cert: /usr/local/bin/f5-bastion.dsc.umich.edu.cert
+        client_key: /usr/local/bin/f5-bastion.dsc.umich.edu.key
+        app_id: "f5-bastion-ansible-appid"
+        query: "Object=F5-Ansible"
+        connection_timeout: 60
+        query_format: Exact
+        fail_request_on_password_change: True
+        reason: "requesting credential for deployment"
+      register: cyberark_result
+
+    - set_fact:
+        f5_pass: "{{ cyberark_result.result.Content }}"
+
+- name: Update SSL certificates on F5 devices
+  hosts: f5
+  gather_facts: false
+  vars:
+    team: "IAM" # Adjust this variable for your team or however your partition is built ours is IAM-NONPROD-MACC for example.
+    role: "NONPROD"  # Adjust this variable to switch between roles like NONPROD, PROD, etc.
+    f5_user: "f5serviceadmin"
+    f5_ssl_cert_name: "" # put the name of the ssl cert here without file extension
+    f5_ssl_client_profile: "" # Add the SSL client profile exactly as it is on the f5
+    f5_ssl_home_user: "mcommadm" # Adjust this variable to your service account
+    f5_ssl_home_path: "/home/{{ f5_ssl_home_user }}/{{ role | lower }}"
+    f5_ssl_certificate_path: "{{ f5_ssl_home_path }}/{{ f5_ssl_cert_name }}.cert"
+    f5_ssl_key_name: "{{ f5_ssl_cert_name }}"
+    f5_ssl_key_path: "{{ f5_ssl_home_path }}/{{ f5_ssl_key_name }}.key"
+    f5_ssl_chain_name: "InCommonECCServerCA3" # change this to whatever chain file you're using could be RSA or ECC
+    f5_ssl_chain_path: "{{ f5_ssl_home_path }}/{{ f5_ssl_chain_name }}.crt"
+
+  tasks:
+
+    - name: Get current date for unique object naming
+      set_fact:
+        deploy_date: "{{ lookup('pipe', 'date +%Y%m%d') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set date suffix
+      set_fact:
+        suffix: "ansible-f5-{{ deploy_date }}"
+
+    - name: Ensure datacenter variable is defined
+      assert:
+        that:
+          - datacenter is defined
+        fail_msg: "The 'datacenter' variable is not defined. Ensure it is set in the inventory."
+
+    - name: Set the partition name
+      set_fact:
+        partition_name: "{{ team }}-{{ role }}-{{ datacenter }}"
+
+    - name: Update SSL cert on F5 device
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider:
+          server: "{{ inventory_hostname }}"
+          user: "{{ f5_user }}"
+          password: "{{ hostvars['localhost']['f5_pass'] }}"
+          server_port: 443
+          validate_certs: no
+          transport: rest
+        name: "{{ f5_ssl_cert_name }}-{{ suffix }}"
+        partition: "{{ partition_name }}"
+        content: "{{ lookup('file', f5_ssl_certificate_path) }}"
+        state: present
+      delegate_to: localhost
+      become: no
+      when: datacenter is defined
+
+    - name: Update SSL key on F5 device
+      f5networks.f5_modules.bigip_ssl_key:
+        provider:
+          server: "{{ inventory_hostname }}"
+          user: "{{ f5_user }}"
+          password: "{{ hostvars['localhost']['f5_pass'] }}"
+          server_port: 443
+          validate_certs: no
+          transport: rest
+        name: "{{ f5_ssl_key_name }}-{{ suffix }}"
+        partition: "{{ partition_name }}"
+        content: "{{ lookup('file', f5_ssl_key_path) }}"
+        state: present
+      delegate_to: localhost
+      become: no
+      when: datacenter is defined
+
+    - name: Upload SSL chain to F5 device
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider:
+          server: "{{ inventory_hostname }}"
+          user: "{{ f5_user }}"
+          password: "{{ hostvars['localhost']['f5_pass'] }}"
+          server_port: 443
+          validate_certs: no
+          transport: rest
+        name: "{{ f5_ssl_chain_name }}"
+        partition: "{{ partition_name }}"
+        content: "{{ lookup('file', f5_ssl_chain_path) }}"
+        state: present
+      delegate_to: localhost
+      become: no
+      when: datacenter is defined
+
+    - name: Update SSL Client Profile on f5
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        provider:
+          server: "{{ inventory_hostname }}"
+          user: "{{ f5_user }}"
+          password: "{{ hostvars['localhost']['f5_pass'] }}"
+          validate_certs: no
+          transport: rest
+        state: present
+        partition: "{{ partition_name }}"
+        name: "{{ f5_ssl_client_profile }}"
+        cert_key_chain:
+          - cert: "{{ f5_ssl_cert_name }}-{{ suffix }}"
+            key: "{{ f5_ssl_key_name }}-{{ suffix }}"
+            chain: "{{ f5_ssl_chain_name }}"
+      delegate_to: localhost
+      become: no
+      when: datacenter is defined
